@@ -35,6 +35,11 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Root path health check endpoint for Uptime Robot
+app.get('/', (req, res) => {
+  res.status(200).send("VEL Backend API is running safely.");
+});
+
 // Initialize Firebase Admin SDK
 let serviceAccount = null;
 
