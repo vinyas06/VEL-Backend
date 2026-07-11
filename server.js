@@ -7,6 +7,8 @@ import admin from 'firebase-admin';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { getPartyFinancialSummary, getDriverMonthSummary } from './calculations.js';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
 
 dotenv.config();
 
@@ -38,6 +40,86 @@ app.use(express.json());
 // Root path health check endpoint for Uptime Robot
 app.get('/', (req, res) => {
   res.status(200).send("VEL Backend API is running safely.");
+});
+
+// Setup HTTP Server & WebSockets
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: allowedOrigins,
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
+
+// WebSockets connection handler
+io.on('connection', (socket) => {
+  console.log(`Client connected: ${socket.id}`);
+
+  socket.on('driver_location_update', async (data) => {
+    // Expected payload: { driverName, latitude, longitude }
+    const { driverName, latitude, longitude } = data;
+    if (!driverName || latitude == null || longitude == null) return;
+
+    console.log(`Location update from ${driverName}: ${latitude}, ${longitude}`);
+
+    try {
+      const timestamp = new Date().toISOString();
+
+      // 1. Update driver's current active location in Firestore (doc ID is driverName)
+      await db.collection('driver_locations').doc(driverName).set({
+        driverName,
+        latitude: Number(latitude),
+        longitude: Number(longitude),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // 2. Fetch last saved history point from Firestore to prevent duplicate coordinate spam
+      const lastHistSnap = await db.collection('driver_locations').doc(driverName).get();
+      let shouldSaveHistory = true;
+      
+      const lastHist = lastHistSnap.exists ? lastHistSnap.data() : null;
+      if (lastHist && lastHist.lastHistLat != null && lastHist.lastHistLng != null) {
+        // Approximate distance check (under 50m)
+        const dy = Number(latitude) - Number(lastHist.lastHistLat);
+        const dx = (Number(longitude) - Number(lastHist.lastHistLng)) * Math.cos(Number(latitude) * Math.PI / 180);
+        const distanceMeters = Math.sqrt(dx * dx + dy * dy) * 111320;
+        if (distanceMeters < 50) {
+          shouldSaveHistory = false;
+        }
+      }
+
+      if (shouldSaveHistory) {
+        await db.collection('driver_location_history').add({
+          driverName,
+          latitude: Number(latitude),
+          longitude: Number(longitude),
+          timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        
+        // Save this as the last cached history coordinate
+        await db.collection('driver_locations').doc(driverName).update({
+          lastHistLat: Number(latitude),
+          lastHistLng: Number(longitude),
+        });
+      }
+
+      // 3. Broadcast the location event to all other connected clients
+      io.emit('location_update', {
+        driverName,
+        latitude: Number(latitude),
+        longitude: Number(longitude),
+        updatedAt: timestamp,
+      });
+
+    } catch (err) {
+      console.error(`WebSocket location update failed for ${driverName}:`, err);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`Client disconnected: ${socket.id}`);
+  });
 });
 
 // Initialize Firebase Admin SDK
@@ -577,8 +659,46 @@ app.post('/api/notifications/send-customer-bill', async (req, res) => {
   }
 });
 
+// GET /api/driver/location-history/:driverName
+// Returns coordinate trace points logged in the last 24 hours
+app.get('/api/driver/location-history/:driverName', async (req, res) => {
+  try {
+    const { driverName } = req.params;
+    if (!driverName) {
+      return res.status(400).json({ error: "Missing driverName parameter." });
+    }
+
+    // 24 hours ago timestamp
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+
+    const snapshot = await db.collection('driver_location_history')
+        .where('driverName', '==', driverName)
+        .where('timestamp', '>=', twentyFourHoursAgo)
+        .get();
+
+    const pathData = snapshot.docs
+        .map(doc => {
+          const data = doc.data();
+          const timestamp = data.timestamp;
+          return {
+            lat: data.latitude,
+            lng: data.longitude,
+            time: timestamp && timestamp.toDate ? timestamp.toDate().toISOString() : (timestamp || ""),
+          };
+        });
+
+    // Sort path points chronologically
+    pathData.sort((a, b) => a.time.localeCompare(b.time));
+
+    res.json(pathData);
+  } catch (error) {
+    console.error("Error fetching driver location history:", error);
+    res.status(500).json({ error: "Failed to load location history." });
+  }
+});
+
 // Run server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log(`Backend server is running securely on port ${PORT}`);
 });
