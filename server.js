@@ -659,6 +659,22 @@ app.post('/api/notifications/send-customer-bill', async (req, res) => {
   }
 });
 
+// GET /api/driver/locations
+// Returns all active driver locations
+app.get('/api/driver/locations', async (req, res) => {
+  try {
+    const snapshot = await db.collection('driver_locations').get();
+    const locations = snapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+    res.json(locations);
+  } catch (error) {
+    console.error("Error fetching driver locations:", error);
+    res.status(500).json({ error: "Failed to load driver locations." });
+  }
+});
+
 // GET /api/driver/location-history/:driverName
 // Returns coordinate trace points logged in the last 24 hours
 app.get('/api/driver/location-history/:driverName', async (req, res) => {
